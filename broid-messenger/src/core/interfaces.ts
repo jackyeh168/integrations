@@ -5,7 +5,8 @@ export interface IAdapterHTTPOptions {
 
 export interface IAdapterOptions {
   logLevel: string;
-  http: IAdapterHTTPOptions;
+  webhookURL: string;
+  http?: IAdapterHTTPOptions;
   serviceID: string;
   token: string;
   tokenSecret: string;

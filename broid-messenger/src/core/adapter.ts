@@ -1,10 +1,13 @@
 import * as Promise from "bluebird";
 import broidSchemas from "broid-schemas";
 import { concat, Logger } from "broid-utils";
-import * as uuid from "node-uuid";
+import * as uuid from "uuid";
 import * as R from "ramda";
 import * as rp from "request-promise";
+import { EventEmitter } from "events";
+import { Router } from "express";
 import { Observable } from "rxjs/Rx";
+
 
 import { IAdapterHTTPOptions, IAdapterOptions, IWebHookEvent } from "./interfaces";
 import Parser from "./parser";
@@ -20,14 +23,19 @@ export default class Adapter {
   private storeUsers: Map<string, Object>;
   private token: string | null;
   private tokenSecret: string | null;
+  private router: Router;
   private webhookServer: WebHookServer;
+  private webhookURL: string;
+  private emitter: EventEmitter;
 
-  constructor(obj?: IAdapterOptions) {
+  constructor(obj: IAdapterOptions) {
     this.serviceID = obj && obj.serviceID || uuid.v4();
     this.logLevel = obj && obj.logLevel || "info";
     this.token = obj && obj.token || null;
     this.tokenSecret = obj && obj.tokenSecret || null;
     this.storeUsers = new Map();
+    this.webhookURL = obj && obj.webhookURL.replace(/\/?$/, "/") || "";
+    this.emitter = new EventEmitter();
 
     const HTTPOptions: IAdapterHTTPOptions = {
       host: "127.0.0.1",
@@ -39,6 +47,12 @@ export default class Adapter {
 
     this.parser = new Parser(this.serviceID, this.logLevel);
     this.logger = new Logger("adapter", this.logLevel);
+    this.router = this.setupRouter();
+
+    if (obj.http) {
+      this.webhookServer = new WebHookServer(this.tokenSecret || '', obj.http, this.router,
+        this.logLevel);
+    }
   }
 
   // Return list of users information
@@ -56,23 +70,34 @@ export default class Adapter {
     return this.serviceID;
   }
 
+  // Returns the intialized express router
+  public getRouter(): Router {
+    if (this.webhookServer) {
+      return false;
+    }
+
+    return this.router;
+  }
+
   // Connect to Messenger
   // Start the webhook server
   public connect(): Observable<Object> {
     if (this.connected) {
       return Observable.of({ type: "connected", serviceID: this.serviceId() });
     }
+    this.connected = true;
 
     if (!this.token
       || !this.tokenSecret) {
       return Observable.throw(new Error("Credentials should exist."));
     }
+    if (!this.webhookURL) {
+      return Observable.throw(new Error("webhookURL should exist."));
+    }
 
-    this.connected = true;
-
-    this.webhookServer = new WebHookServer(this.tokenSecret, this.HTTPOptions,
-      this.logLevel);
-    this.webhookServer.listen();
+    if (this.webhookServer) {
+      this.webhookServer.listen();
+    }
 
     return Observable.of({ type: "connected", serviceID: this.serviceId() });
   }
@@ -83,7 +108,7 @@ export default class Adapter {
 
   // Listen "message" event from Messenger
   public listen(): Observable<Object> {
-    return Observable.fromEvent(this.webhookServer, "message")
+    return Observable.fromEvent(this.emitter, "message")
       .mergeMap((event: IWebHookEvent) => this.parser.normalize(event))
       .mergeMap((messages: any) => Observable.from(messages))
       .mergeMap((message: any) => this.user(message.author)
@@ -232,7 +257,7 @@ export default class Adapter {
             qs: { access_token: this.token },
             uri: "https://graph.facebook.com/v2.8/me/messages",
           })
-          .then(() => ({ type: "sent", serviceID: this.serviceId() }));
+            .then(() => ({ type: "sent", serviceID: this.serviceId() }));
         }
 
         return Promise.reject(new Error("Only Note, Image, and Video are supported."));
@@ -253,10 +278,40 @@ export default class Adapter {
       qs: { access_token: this.token, fields },
       uri: `https://graph.facebook.com/v2.8/${id}`,
     })
-    .then((data: any) => {
-      data.id = data.id || id;
-      this.storeUsers.set(key, data);
-      return data;
+      .then((data: any) => {
+        data.id = data.id || id;
+        this.storeUsers.set(key, data);
+        return data;
+      });
+  }
+
+  private setupRouter(): Router {
+
+    const router = Router();
+
+    // Endpoint to verify the trust
+    router.get("/", (req, res) => {
+      if (req.query["hub.mode"] === "subscribe") {
+        if (req.query["hub.verify_token"] === this.tokenSecret) {
+          res.send(req.query["hub.challenge"]);
+        } else {
+          res.send("OK");
+        }
+      }
     });
+
+    // route handler
+    router.post("/", (req, res) => {
+      const event: IWebHookEvent = {
+        request: req,
+        response: res,
+      };
+
+      this.emitter.emit("message", event);
+
+      // Assume all went well.
+      res.sendStatus(200);
+    });
+    return router;
   }
 }
